@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import os
-import threading
 import logging
-import requests
 import uvicorn
-from fastapi import FastAPI
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request, Response
+from telegram import Update
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,12 +16,51 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-web_app = FastAPI()
+bot_app = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global bot_app
+    from telegram_bot_enhanced import EnhancedAliExpressTelegramBot
+
+    bot = EnhancedAliExpressTelegramBot()
+    bot_app = bot.application
+    await bot_app.initialize()
+    await bot_app.start()
+
+    render_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if render_url:
+        webhook_url = f"{render_url}/webhook"
+        await bot_app.bot.set_webhook(
+            url=webhook_url,
+            drop_pending_updates=True
+        )
+        logger.info(f"Webhook set: {webhook_url}")
+    else:
+        logger.warning("RENDER_EXTERNAL_URL not set — webhook not registered")
+
+    yield
+
+    await bot_app.bot.delete_webhook()
+    await bot_app.stop()
+    await bot_app.shutdown()
+
+
+web_app = FastAPI(lifespan=lifespan)
+
+
+@web_app.post("/webhook")
+async def webhook(request: Request):
+    data = await request.json()
+    update = Update.de_json(data, bot_app.bot)
+    await bot_app.process_update(update)
+    return Response(status_code=200)
 
 
 @web_app.get("/")
 def root():
-    return {"status": "AliExpress Telegram Bot is running!", "bot": "active"}
+    return {"status": "AliExpress Telegram Bot is running!", "mode": "webhook"}
 
 
 @web_app.get("/health")
@@ -30,49 +69,22 @@ def health():
 
 
 @web_app.get("/check")
-def check():
-    token = os.getenv("TELEGRAM_TOKEN", "NOT_SET")
-    result = {
-        "token_set": token != "NOT_SET",
-        "token_preview": token[:10] + "..." if len(token) > 10 else token,
-        "telegram_reachable": False,
-        "token_valid": False,
-        "error": None
+async def check():
+    if not bot_app:
+        return {"error": "Bot not initialized"}
+    info = await bot_app.bot.get_webhook_info()
+    me = await bot_app.bot.get_me()
+    return {
+        "bot": me.username,
+        "webhook_url": info.url,
+        "pending_updates": info.pending_update_count,
+        "last_error": info.last_error_message
     }
-    try:
-        resp = requests.get(
-            f"https://api.telegram.org/bot{token}/getMe",
-            timeout=10
-        )
-        result["telegram_reachable"] = True
-        data = resp.json()
-        result["token_valid"] = data.get("ok", False)
-        if data.get("ok"):
-            result["bot_name"] = data["result"].get("username")
-        else:
-            result["error"] = data.get("description")
-    except requests.exceptions.Timeout:
-        result["error"] = "TIMEOUT - Render is blocking Telegram"
-    except Exception as e:
-        result["error"] = str(e)
-    return result
-
-
-def run_bot():
-    try:
-        from telegram_bot_enhanced import EnhancedAliExpressTelegramBot
-        bot = EnhancedAliExpressTelegramBot()
-        logger.info("Starting bot with polling...")
-        bot.run()
-    except Exception as e:
-        logger.error(f"Bot error: {e}")
 
 
 def main():
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
     port = int(os.environ.get("PORT", 10000))
-    logger.info(f"Web server starting on port {port}")
+    logger.info(f"Starting server on port {port}")
     uvicorn.run(web_app, host="0.0.0.0", port=port, log_level="warning")
 
 
